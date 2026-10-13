@@ -60,7 +60,7 @@ Backing Infrastructure:
 
 - [x] **Phase 0: Project Architecture & Setup**
 - [x] **Phase 1: Database Schema, Multi-Tenant Migrations & Objection.js Base Models**
-- [ ] **Phase 2: GraphQL Schema Design, Modular SDL & GraphQL Code Generator**
+- [x] **Phase 2: GraphQL Schema Design, Modular SDL & GraphQL Code Generator**
 - [ ] **Phase 3: Context Pipeline, Authentication (JWT/OIDC) & Multi-Tenant Scoping**
 - [ ] **Phase 4: Multi-Tenant RBAC & Resource-Level Authorization**
 - [ ] **Phase 5: Resolvers, Services & Repositories (Organizations & Users)**
@@ -419,4 +419,308 @@ Tests in `tests/integration/database.test.ts` verify:
 > 1. **Consistent Lock Ordering**: Always acquire locks on rows in deterministic order (e.g., sort primary keys before locking).
 > 2. **Short Transactions**: Minimize processing time inside the transaction boundary; perform network calls and slow hashing outside the transaction.
 > 3. **Automatic Retry with Exponential Backoff & Jitter**: Catch MariaDB Error `1213: Deadlock found when trying to get lock` and retry the transaction after a randomized delay.
+
+---
+
+## 🚀 Phase 2: GraphQL Schema, Apollo Server & Resolvers
+
+### 1. The Internal GraphQL Execution Pipeline
+
+```text
+Client (HTTP POST /graphql with JSON payload: { query, variables })
+  │
+  ▼
+Express Middleware Layer (CORS, body parser, headers extraction)
+  │
+  ▼
+Context Initialization (buildContext generates requestId, extracts user claims)
+  │
+  ▼
+Query Parsing (Converts raw GraphQL query string into an Abstract Syntax Tree: AST)
+  │
+  ▼
+Validation Phase (Validates AST against SDL rules: field existence, types, variables)
+  │   └── If invalid: Fails immediately with GRAPHQL_VALIDATION_FAILED (400)
+  ▼
+Execution Phase (Traverses AST top-down starting from Root Type: Query / Mutation)
+  │
+  ├─► Root Field Resolver: resolvers.Query.users(parent, args, context, info)
+  │     │
+  │     ▼
+  │   Domain Service (userService.getUsers) ──► Business rules & validation
+  │     │
+  │     ▼
+  │   Repository (userRepo.findMany) ──► SQL query with tenant scoping
+  │     │
+  │     ▼
+  │   MariaDB returns rows ──► Transformed into [UserModel]
+  │
+  ▼
+Nested Field Resolution (For each user in the returned list):
+  │
+  ├─► User.id           ──► defaultFieldResolver reads user.id
+  ├─► User.name         ──► defaultFieldResolver reads user.name (or getter)
+  ├─► User.email        ──► defaultFieldResolver reads user.email
+  └─► User.organization ──► Explicit field resolver: resolvers.User.organization(parent)
+        │                     parent = current user object
+        ▼
+      organizationService.getById(parent.organizationId) ──► MariaDB query
+  │
+  ▼
+Response Serialization & Error Masking (formatError filters sensitive stack traces)
+  │
+  ▼
+HTTP 200 OK Response: { "data": { "users": [...] } }
+```
+
+---
+
+### 2. How Apollo Maps Fields to Resolvers
+
+1. **Schema Definition Language (SDL)**: The formal, human-readable contract defining object types, fields, inputs, and root operations (`Query`, `Mutation`, `Subscription`).
+2. **The Resolver Function**: A function with signature `(parent, args, context, info)` responsible for populating data for a specific field on a specific type.
+3. **The Dispatch Algorithm**:
+   - Apollo Server maps SDL types to an internal JavaScript object lookup tree: `resolvers[TypeName][FieldName]`.
+   - When resolving field `users` under `type Query`, Apollo invokes `resolvers.Query.users`.
+   - When resolving field `organization` under `type User`, Apollo invokes `resolvers.User.organization`.
+4. **The `defaultFieldResolver`**:
+   - If a field is declared in the SDL (e.g. `User.email`) but has **no explicit resolver** in your code, GraphQL uses its built-in fallback:
+     ```javascript
+     function defaultFieldResolver(parent, args, context, info) {
+       if (typeof parent === 'object' && parent !== null) {
+         const property = parent[info.fieldName];
+         return typeof property === 'function' ? property() : property;
+       }
+     }
+     ```
+   - It reads property `parent[info.fieldName]`. This is why scalar fields matching database columns require zero boilerplate resolvers!
+
+---
+
+### 3. Resolver Arguments: `(parent, args, context, info)`
+
+```typescript
+async (parent, args, context, info) => { ... }
+```
+
+| Parameter | Type / Source | Purpose | Example in our codebase |
+|---|---|---|---|
+| **`parent`** (or `root`) | Object returned by the parent field resolver | Crucial for **nested resolvers**. Allows a child resolver to access the parent entity's ID or properties. | In `User.organization`, `parent` is the `User` object, so `parent.organizationId` is used to load the organization. |
+| **`args`** | Object parsed from the GraphQL query arguments | Contains strongly typed parameters defined in SDL arguments or input types. | In `Query.user(id: ID!)`, `args.id` contains `"1"`. In `Mutation.createUser(input: CreateUserInput!)`, `args.input` contains `{ name, email, organizationId }`. |
+| **`context`** | Initialized once per HTTP request via `buildContext` | Shared state across the entire resolver tree: correlation ID, authenticated user, tenant ID, and DataLoaders. | `context.requestId`, `context.user?.tenantId`. |
+| **`info`** | `GraphQLResolveInfo` (AST execution metadata) | Contains execution state, field name, AST selection set, field paths, and schema definition. | Used by advanced query complexity analyzers and selective SQL column pushdowns (`SELECT only requested fields`). |
+
+---
+
+### 4. Modular Schema Composition
+
+Instead of a monolithic schema file, the schema is decomposed into modular domain slices:
+```text
+src/graphql/
+├── schema/
+│   ├── root.graphql          # Root Query, Mutation, and HealthStatus
+│   ├── organization.graphql  # Organization type & Query extensions
+│   ├── user.graphql          # User type, inputs, Query & Mutation extensions
+│   └── index.ts              # Composes all .graphql files into typeDefs array
+├── resolvers/
+│   ├── organization.resolver.ts
+│   ├── user.resolver.ts
+│   └── index.ts              # Merges domain resolvers into unified resolvers map
+└── context/
+    └── context.ts            # Strongly typed context factory
+```
+
+In `src/graphql/schema/index.ts`:
+```typescript
+export const typeDefs = [rootTypeDefs, organizationTypeDefs, userTypeDefs];
+```
+In `src/graphql/resolvers/index.ts`:
+```typescript
+export const resolvers: Resolvers = {
+  Query: {
+    health: () => ({ ... }),
+    ...organizationResolvers.Query,
+    ...userResolvers.Query,
+  },
+  Mutation: {
+    ...userResolvers.Mutation,
+  },
+  User: {
+    ...userResolvers.User,
+  },
+};
+```
+
+---
+
+### 5. GraphQL Code Generator Pipeline
+
+GraphQL Code Generator (`codegen.ts`) enforces compile-time type safety across the entire API:
+```text
+*.graphql SDL files  ──►  graphql-codegen  ──►  src/graphql/generated/types.ts
+```
+
+#### Why this is superior:
+1. **Zero Manual Type Duplication**: If a field is added to `user.graphql`, running `npm run codegen` automatically updates TypeScript interfaces.
+2. **Compile-Time Typo Protection**: If a resolver attempts to return a property not defined in SDL:
+   ```typescript
+   // ❌ TypeScript Compiler Error:
+   // Type '{ id: string; wrongField: boolean }' is not assignable to type 'User'.
+   return { id: "1", wrongField: true };
+   ```
+3. **Context Binding**: Resolvers automatically inherit the typed `GraphQLContext` without manual casting.
+
+---
+
+### 6. Nested Resolvers & Introduction to the N+1 Problem
+
+In `user.resolver.ts`:
+```typescript
+User: {
+  organization: async (parent) => {
+    // Executes for EACH user in the parent query!
+    return await organizationService.getById(parent.organizationId);
+  },
+}
+```
+
+#### Why this causes the N+1 Problem:
+When a client queries 50 users and their organization:
+```graphql
+query {
+  users {
+    id
+    name
+    organization {
+      name
+    }
+  }
+}
+```
+1. `Query.users` executes **1 SQL query**: `SELECT * FROM users WHERE deleted_at IS NULL` (returns 50 users).
+2. For each user, Apollo invokes `User.organization(parent)`:
+   - User 1: `SELECT * FROM organizations WHERE id = 1`
+   - User 2: `SELECT * FROM organizations WHERE id = 1`
+   - ...
+   - User 50: `SELECT * FROM organizations WHERE id = 2`
+3. **Total Database Queries = 1 + 50 = 51 queries!**
+
+> **Note**: In Phase 6, we will resolve this using **DataLoader**, which batches these 50 individual queries into a single deduplicated SQL query: `SELECT * FROM organizations WHERE id IN (1, 2)`.
+
+---
+
+### 7. Interactive Verification (Apollo Sandbox & cURL)
+
+#### 1. Open Interactive Apollo Sandbox
+Navigate to your browser:
+```text
+http://localhost:4000/graphql
+```
+Apollo Server 4 automatically serves the embedded Apollo Sandbox landing page with complete schema discovery and auto-completion.
+
+#### 2. Query Users with Nested Organization (cURL)
+```bash
+curl -X POST http://localhost:4000/graphql \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "query { users { id name email organization { name slug } } }"
+  }'
+```
+
+#### 3. Create User Mutation (cURL)
+```bash
+curl -X POST http://localhost:4000/graphql \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "mutation CreateUser($input: CreateUserInput!) { createUser(input: $input) { id name email organization { name } } }",
+    "variables": {
+      "input": {
+        "organizationId": "1",
+        "name": "Grace Hopper",
+        "email": "grace.hopper@acme.com"
+      }
+    }
+  }'
+```
+
+---
+
+### 8. Comprehensive Troubleshooting & Debugging Guide
+
+#### Issue 1: Apollo Sandbox does not show the schema / fails to introspect
+- **Symptom**: Sandbox shows "Unable to reach server" or schema explorer is blank.
+- **Root Cause**: `introspection: true` is omitted in production mode, or `ApolloServerPluginLandingPageLocalDefault` is missing.
+- **How to Verify**: Run `curl -X POST http://localhost:4000/graphql -H "Content-Type: application/json" -d '{"query": "{ __schema { types { name } } }"}'`. If it returns `"Introspection is disabled"`, introspection is off.
+- **Fix**: Explicitly set `introspection: true` and configure `ApolloServerPluginLandingPageLocalDefault({ embed: true })` in `src/app.ts`.
+
+#### Issue 2: Apollo says "Cannot query field 'x' on type 'Query'"
+- **Symptom**: Query fails with `GRAPHQL_VALIDATION_FAILED`.
+- **Root Cause**: The field is missing from SDL, spelled incorrectly, or the typeDefs array omitted the domain schema slice.
+- **How to Verify**: Check `src/graphql/schema/index.ts` to ensure the schema slice is imported and included in `typeDefs`.
+- **Fix**: Add `extend type Query { ... }` in the appropriate `.graphql` file and rebuild.
+
+#### Issue 3: Resolver is not being called
+- **Symptom**: Field returns `null` or default scalar value without hitting service breakpoints/logs.
+- **Root Cause**: Naming mismatch between SDL field name and resolver object key (e.g. SDL has `createUser` but resolver has `create_user`).
+- **How to Verify**: Log `Object.keys(resolvers.Query)` at boot time.
+- **Fix**: Ensure `resolvers.Query[fieldName]` matches the exact case of `Query.fieldName` in SDL.
+
+#### Issue 4: Resolver returns `undefined`
+- **Symptom**: GraphQL response contains `"Cannot return null for non-nullable field"`.
+- **Root Cause**: In JavaScript, an async function with no explicit return or missing property returns `undefined`. GraphQL treats `undefined` as `null`. If the SDL declares the field as non-nullable (`String!`), GraphQL halts execution and bubbles an error up the tree.
+- **How to Verify**: Check the resolver return value; verify database query didn't return an empty record.
+- **Fix**: Return a valid object or throw a `NotFoundError`.
+
+#### Issue 5: GraphQL Code Generator doesn't generate types
+- **Symptom**: `npm run codegen` fails with `Unable to find any GraphQL type definitions`.
+- **Root Cause**: Pointer glob in `codegen.ts` does not match schema file paths, or invalid GraphQL syntax exists in a `.graphql` file.
+- **How to Verify**: Run `npx graphql-codegen --debug` to inspect the file loader.
+- **Fix**: Ensure `schema: "./src/graphql/schema/**/*.graphql"` matches the schema files and all syntax is valid SDL.
+
+#### Issue 6: `SyntaxError: The requested module does not provide an export named 'GraphQLContext'`
+- **Symptom**: Server crashes on startup with ESM syntax error.
+- **Root Cause**: TypeScript `interface` imported as a JavaScript runtime value in ESM (`"type": "module"`).
+- **How to Verify**: Look at the import statement in `src/app.ts`.
+- **Fix**: Use `import { buildContext, type GraphQLContext } from "..."`.
+
+#### Issue 7: Apollo starts but `/graphql` returns 404 or hangs
+- **Symptom**: `curl http://localhost:4000/graphql` returns 404 or connection refused.
+- **Root Cause**: `expressMiddleware(apolloServer)` was mounted before `express.json()` was loaded, or `apolloServer.start()` was not awaited before mounting.
+- **How to Verify**: Ensure `await apolloServer.start()` finishes before `app.use('/graphql', expressMiddleware(apolloServer))`.
+- **Fix**: Follow the strict middleware order in `src/app.ts`.
+
+---
+
+### 9. Senior-Level Interview Questions (Phase 2)
+
+#### Q1: What happens under the hood when a GraphQL query string arrives at Apollo Server?
+> **Answer**:
+> 1. **Parsing**: The raw query string is lexed and parsed by `graphql-js` into an **Abstract Syntax Tree (AST)** (`DocumentNode`).
+> 2. **Validation**: The AST is validated against the schema rules (type checking, field existence, fragment spread validity, variable types). If validation fails, execution halts immediately with zero resolver invocations.
+> 3. **Execution**: The execution engine traverses the AST selection sets recursively. Starting at the root type (`Query`/`Mutation`), it matches AST field nodes to resolver functions, invokes them concurrently with `(parent, args, context, info)`, awaits asynchronous promises, and shapes the result into the requested JSON response format.
+
+#### Q2: What is the `defaultFieldResolver` in GraphQL, and how does it affect backend performance?
+> **Answer**:
+> In GraphQL, every single field in a selection set must be resolved. Rather than forcing developers to write resolvers for trivial properties (`id`, `email`, `createdAt`), GraphQL provides `defaultFieldResolver`:
+> ```javascript
+> (parent, args, context, info) => parent?.[info.fieldName]
+> ```
+> This has major architectural implications:
+> - Scalar fields matching database models execute synchronously in microsecond time with zero overhead.
+> - Only relation fields (e.g. `User.organization`) or computed fields (e.g. `User.fullName`) require custom resolver functions.
+
+#### Q3: Why is GraphQL Context created per request rather than as a global singleton?
+> **Answer**:
+> In a multi-tenant web application, a global context singleton would cause catastrophic **data leaks and race conditions**:
+> 1. **Tenant Isolation**: Tenant IDs and user authorization claims differ per HTTP request; sharing context would allow Request A to read Request B's tenant data.
+> 2. **DataLoader Caching**: DataLoaders cache promise results per request. If context were shared globally across requests, User A would receive cached data originally requested by User B, bypassing authorization and creating stale state.
+> 3. **Request Tracing**: `requestId` and execution timers must belong strictly to one HTTP lifecycle.
+
+#### Q4: Why should business validation be placed in the Domain Service layer rather than in GraphQL Resolvers?
+> **Answer**:
+> Placing validation in resolvers couples business logic to the transport layer:
+> 1. If an operation is invoked through a background queue worker, a gRPC service, or a CLI seed script, resolver-based validation is completely bypassed.
+> 2. Unit testing requires mocking Apollo resolver parameters (`parent`, `args`, `context`, `info`) instead of passing plain objects to a service method.
+> 3. Resolvers should strictly translate GraphQL input types to domain models, call the service, and map domain outputs to GraphQL types.
+
 

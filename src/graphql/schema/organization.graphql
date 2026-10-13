@@ -1,0 +1,12 @@
+type Organization {
+  id: ID!
+  name: String!
+  slug: String!
+  status: String!
+  createdAt: String!
+}
+
+extend type Query {
+  organization(id: ID!): Organization
+  organizations: [Organization!]!
+}

@@ -3,41 +3,16 @@ import cors from "cors";
 import { ApolloServer } from "@apollo/server";
 import { expressMiddleware } from "@apollo/server/express4";
 import { ApolloServerPluginDrainHttpServer } from "@apollo/server/plugin/drainHttpServer";
+import { ApolloServerPluginLandingPageLocalDefault } from "@apollo/server/plugin/landingPage/default";
 import http from "node:http";
 import { checkDatabaseConnection } from "./infrastructure/database/knex.js";
 import { checkRedisConnection } from "./infrastructure/redis/redis.js";
 import { logger } from "./core/logger/logger.js";
+import { typeDefs } from "./graphql/schema/index.js";
+import { resolvers } from "./graphql/resolvers/index.js";
+import { buildContext, type GraphQLContext } from "./graphql/context/context.js";
 
-// Minimal root schema for Phase 0 verification
-const typeDefs = `#graphql
-  type Query {
-    health: HealthStatus!
-  }
-
-  type HealthStatus {
-    status: String!
-    timestamp: String!
-    uptime: Float!
-    version: String!
-  }
-`;
-
-const resolvers = {
-  Query: {
-    health: () => ({
-      status: "UP",
-      timestamp: new Date().toISOString(),
-      uptime: process.uptime(),
-      version: "1.0.0",
-    }),
-  },
-};
-
-export interface GraphQLContext {
-  req: Request;
-  res: Response;
-  startTime: number;
-}
+export type { GraphQLContext };
 
 export interface AppServer {
   app: Express;
@@ -52,9 +27,13 @@ export async function createApp(): Promise<AppServer> {
   const apolloServer = new ApolloServer<GraphQLContext>({
     typeDefs,
     resolvers,
-    plugins: [ApolloServerPluginDrainHttpServer({ httpServer })],
+    introspection: true, // Enables schema introspection for Apollo Sandbox & tools
+    plugins: [
+      ApolloServerPluginDrainHttpServer({ httpServer }),
+      // Embed interactive Apollo Sandbox in development browser visits
+      ApolloServerPluginLandingPageLocalDefault({ embed: true }),
+    ],
     formatError: (formattedError, error) => {
-      // In production, mask internal server error details to prevent information leakage
       logger.error({ formattedError, error }, "GraphQL execution error");
       return formattedError;
     },
@@ -90,15 +69,11 @@ export async function createApp(): Promise<AppServer> {
     });
   });
 
-  // Apollo GraphQL Endpoint
+  // Apollo GraphQL Endpoint with strongly typed context factory
   app.use(
     "/graphql",
     expressMiddleware(apolloServer, {
-      context: async ({ req, res }): Promise<GraphQLContext> => ({
-        req,
-        res,
-        startTime: Date.now(),
-      }),
+      context: async ({ req, res }): Promise<GraphQLContext> => buildContext({ req, res }),
     })
   );
 

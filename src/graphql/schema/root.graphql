@@ -1,0 +1,14 @@
+type Query {
+  health: HealthStatus!
+}
+
+type Mutation {
+  _empty: String
+}
+
+type HealthStatus {
+  status: String!
+  timestamp: String!
+  uptime: Float!
+  version: String!
+}
