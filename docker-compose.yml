@@ -1,0 +1,46 @@
+services:
+  mariadb:
+    image: mariadb:11.4
+    container_name: enterprise_lms_mariadb
+    restart: unless-stopped
+    command: [
+      "--character-set-server=utf8mb4",
+      "--collation-server=utf8mb4_unicode_ci",
+      "--wait_timeout=28800",
+      "--interactive_timeout=28800"
+    ]
+    environment:
+      MARIADB_ROOT_PASSWORD: root_password_123
+      MARIADB_DATABASE: enterprise_lms
+      MARIADB_USER: lms_user
+      MARIADB_PASSWORD: lms_password_123
+    ports:
+      - "3306:3306"
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-u", "root", "-proot_password_123"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: enterprise_lms_redis
+    restart: unless-stopped
+    command: ["--requirepass", "redis_password_123"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis_password_123", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  mariadb_data:
+  redis_data:
