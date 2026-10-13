@@ -11,6 +11,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "codegen": "graphql-codegen --config codegen.ts",
+    "migrate:latest": "tsx ./node_modules/knex/bin/cli.js --knexfile knexfile.ts migrate:latest",
+    "migrate:rollback": "tsx ./node_modules/knex/bin/cli.js --knexfile knexfile.ts migrate:rollback",
+    "migrate:status": "tsx ./node_modules/knex/bin/cli.js --knexfile knexfile.ts migrate:status",
+    "seed:run": "tsx ./node_modules/knex/bin/cli.js --knexfile knexfile.ts seed:run",
     "docker:up": "docker compose up -d",
     "docker:down": "docker compose down",
     "docker:logs": "docker compose logs -f"

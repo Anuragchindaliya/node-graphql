@@ -59,7 +59,7 @@ Backing Infrastructure:
 ## 🗺️ Implementation Roadmap
 
 - [x] **Phase 0: Project Architecture & Setup**
-- [ ] **Phase 1: Database Schema, Multi-Tenant Migrations & Objection.js Base Models**
+- [x] **Phase 1: Database Schema, Multi-Tenant Migrations & Objection.js Base Models**
 - [ ] **Phase 2: GraphQL Schema Design, Modular SDL & GraphQL Code Generator**
 - [ ] **Phase 3: Context Pipeline, Authentication (JWT/OIDC) & Multi-Tenant Scoping**
 - [ ] **Phase 4: Multi-Tenant RBAC & Resource-Level Authorization**
@@ -215,3 +215,208 @@ curl -X POST http://localhost:4000/graphql \
 > 3. Flush and terminate cache connections (`redis.quit()`).
 > 4. Drain and close SQL connection pools (`knex.destroy()`).
 > 5. Flush pending logger buffers and exit with `0`. A fallback timer (`setTimeout` -> `process.exit(1)`) guarantees the process terminates even if an asynchronous handle leaks.
+
+---
+
+## 💾 Phase 1: Database Architecture & Data Layer
+
+### 1. Entity Relationship (ER) Design
+
+```text
+                               ┌───────────────────┐
+                               │   organizations   │ (Tenants)
+                               └─────────┬─────────┘
+        ┌───────────────────┬────────────┼────────────┬───────────────────┐
+        │ 1:N               │ 1:N        │ 1:N        │ 1:N               │ 1:N
+        ▼                   ▼            ▼            ▼                   ▼
+┌───────────────┐   ┌──────────────┐ ┌───────┐ ┌──────────────┐ ┌───────────────────┐
+│  departments  │   │  positions   │ │ roles │ │ competencies │ │      courses      │
+└───────┬───────┘   └──────┬───────┘ └───┬───┘ └──────┬───────┘ └─────────┬─────────┘
+        │ 1:N              │ 1:N         │            │ 1:N               │ 1:N
+        ▼                  ▼             │            ▼                   ▼
+┌──────────────────────────────────┐     │     ┌──────────────┐ ┌───────────────────┐
+│              users               │     │     │ competency_  │ │    assessments    │
+└─────────────────┬────────────────┘     │     │    levels    │ └─────────┬─────────┘
+  │ 1:N           │ N:M (via user_roles) │     └──────┬───────┘           │ 1:N
+  │               ▼                      │            │                   ▼
+  │         ┌────────────┐               │            │         ┌───────────────────┐
+  │         │ user_roles │◄──────────────┘            │         │    assessment_    │
+  │         └────────────┘                            │         │     questions     │
+  │                                                   │         └─────────┬─────────┘
+  ├────────────────────────────────────────┐          │                   │ 1:N
+  │ 1:N                                    │ 1:N      │                   ▼
+  ▼                                        ▼          │         ┌───────────────────┐
+┌──────────────────┐             ┌──────────────────┐ │         │    assessment_    │
+│  notifications   │             │    audit_logs    │ │         │      options      │
+└──────────────────┘             └──────────────────┘ │         └───────────────────┘
+  │                                        │          │                   │
+  │ 1:N                                    │          │ 1:N               │
+  ▼                                        │          ▼                   ▼
+┌──────────────────┐                       │   ┌──────────────┐ ┌───────────────────┐
+│   assessment_    │                       └──►│    user_     │ │    assessment_    │
+│     attempts     ├──────────────────────────►│ competencies │ │      answers      │
+└──────────────────┘                           └──────────────┘ └───────────────────┘
+```
+
+#### Core Cardinalities & Relationship Logic:
+1. **Organization → Users / Departments / Roles / Competencies / Courses / Programs (`1:N`)**:
+   Every domain aggregate belongs strictly to one tenant.
+2. **Users ↔ Roles (`N:M` via `user_roles`)**:
+   Users can hold multiple roles (e.g. Org Admin, Instructor, Learner). The join table carries `tenant_id` with composite primary key `(user_id, role_id)` and index `(tenant_id, role_id)`.
+3. **Roles ↔ Permissions (`N:M` via `role_permissions`)**:
+   Global permissions (`resource:action`) mapped to organization roles.
+4. **Competencies → Levels (`1:N`) & Users (`N:M` via `user_competencies`)**:
+   Competencies define a 5-tier progression (`level_number 1..5`). `user_competencies` stores current proficiency, verified timestamp, and verifying manager.
+5. **Training Programs ↔ Courses (`N:M` via `training_program_courses`)**:
+   Sequential course tracks ordered by `sequence_order`.
+6. **Courses → Assessments → Questions → Options (`1:N` Cascade)**:
+   Course quizzes with single/multiple choice options and automated score calculation.
+
+---
+
+### 2. SQL Schema Design & Data Integrity
+
+All 21 tables conform to production-grade relational rules:
+- **Primary Keys**: `BIGINT UNSIGNED AUTO_INCREMENT` prevents 32-bit ID exhaustion in high-volume tables (audit logs, attempts, answers).
+- **Tenant Isolation**: Every tenant-owned table features `tenant_id BIGINT UNSIGNED NOT NULL` with foreign key `ON DELETE CASCADE`.
+- **Soft Deletes**: Tables supporting recovery have `deleted_at TIMESTAMP NULL` and composite indexes `(tenant_id, status, deleted_at)` or `(tenant_id, deleted_at)`.
+- **Audit Logs**: Immutable append-only design. No `updated_at`, no soft delete. Stores snapshots in `JSON` columns.
+- **Timestamps**: All tables use `timestamps(true, true)` creating `created_at` and `updated_at` defaulting to `CURRENT_TIMESTAMP` with `ON UPDATE CURRENT_TIMESTAMP`.
+
+---
+
+### 3. Knex Migrations (Ordered & Incremental)
+
+Migrations are partitioned into 6 logical domain increments:
+1. `20260214000001_create_tenants_and_auth.ts`: `organizations`, `users`, `roles`, `permissions`, `role_permissions`, `user_roles`
+2. `20260214000002_create_organization_structure.ts`: `departments`, `positions`, alters `users` with FK constraints
+3. `20260214000003_create_competency_framework.ts`: `competencies`, `competency_levels`, `user_competencies`
+4. `20260214000004_create_courses_and_training.ts`: `courses`, `training_programs`, `training_program_courses`, `training_applications`
+5. `20260214000005_create_assessments_and_evaluations.ts`: `assessments`, `assessment_questions`, `assessment_options`, `assessment_attempts`, `assessment_answers`
+6. `20260214000006_create_notifications_and_audit_logs.ts`: `notifications`, `audit_logs`
+
+#### Migration Execution:
+```bash
+# Run all pending migrations
+npm run migrate:latest
+
+# Rollback last migration batch
+npm run migrate:rollback
+
+# Check migration status
+npm run migrate:status
+```
+
+---
+
+### 4. Objection.js Model Layer
+
+Located in `src/infrastructure/database/models/`:
+- **`BaseModel`**: Automatic ISO timestamp injection on `$beforeInsert` and `$beforeUpdate`.
+- **`TenantBaseModel`**: Adds `tenant_id`, `deleted_at`, and `isDeleted` helper.
+- **`relationMappings`**: Lazy getter thunks defining `BelongsToOneRelation`, `HasManyRelation`, and `ManyToManyRelation` with join tables.
+- **`jsonSchema`**: Runtime validation of payload boundaries before hitting SQL engine.
+
+---
+
+### 5. Repository Layer Pattern
+
+Resolvers never query Knex or Objection directly:
+```text
+GraphQL Resolver ──► Domain Service ──► Repository ──► Objection.js ──► MariaDB
+```
+
+Located in `src/infrastructure/repositories/`:
+- **`BaseRepository<T>`**: Generic CRUD (`findById`, `create`, `update`, `delete`).
+- **`TenantRepository<T>`**: Automatically enforces:
+  - Row-level tenant filtering: `where('tenant_id', tenantId)`
+  - Active record filtering: `whereNull('deleted_at')`
+  - Reusable offset pagination (`paginateOffset`) and cursor-based pagination (`paginateCursor`).
+
+---
+
+### 6. ACID Transactions & Atomic Operations
+
+Located in `src/core/transactions/user-registration.transaction.ts`:
+```typescript
+await Model.transaction(db, async (trx) => {
+  // 1. Check duplicate email in tenant
+  // 2. Fetch tenant role
+  // 3. Insert user
+  // 4. Assign role in user_roles
+  // 5. Write immutable audit log
+});
+```
+
+#### ACID Guarantees:
+- **Atomicity**: If audit log creation or role assignment fails, user insertion is rolled back completely.
+- **Consistency**: Database invariants and foreign keys remain valid at all times.
+- **Isolation**: Executed within MariaDB transaction boundary (default `REPEATABLE READ`).
+- **Durability**: Changes written to InnoDB redo log upon commit.
+
+---
+
+### 7. SQL Performance & Optimization
+
+#### EXPLAIN & Indexing Strategy:
+- **Unique Composite Index**: `uq_users_tenant_email` on `(tenant_id, email)` transforms email lookup into a single-row `const` or `eq_ref` B-tree lookup ($O(\log N)$).
+- **Composite State Index**: `idx_courses_tenant_status` on `(tenant_id, status, deleted_at)` allows index scan without full-table scan.
+- **Covering Indexes**: Queries fetching only `id` and `tenant_id` are served entirely from index leaf nodes without touching row data pages.
+
+#### Pagination Trade-off: Offset vs Cursor
+- **Offset Pagination (`OFFSET 10000 LIMIT 20`)**: MariaDB must scan 10,020 rows and discard the first 10,000. Inefficient for large datasets ($O(N)$).
+- **Cursor Pagination (`WHERE id > :after LIMIT 20`)**: Uses the indexed primary key to jump directly to the target record ($O(1)$). Returns opaque base64 cursors conforming to Relay GraphQL specifications.
+
+---
+
+### 8. Seed Data & Verification Tests
+
+Run the seed script to populate 2 independent tenant organizations:
+```bash
+npm run seed:run
+```
+
+#### Test Suite (21 Passing Tests):
+```bash
+npm test
+```
+Tests in `tests/integration/database.test.ts` verify:
+1. Organization retrieval by slug.
+2. Cross-tenant isolation (Tenant A cannot view Tenant B users or courses).
+3. Objection.js deep graph relations (`users -> roles -> permissions`).
+4. ACID transaction commit and rollback guarantees.
+5. Soft-deletion behavior and hidden records in tenant queries.
+6. Offset and cursor pagination behavior.
+7. MariaDB query execution plan (`EXPLAIN`) validating composite indexes.
+
+---
+
+### 9. Senior-Level Interview Questions (Phase 1)
+
+#### Q1: What is the N+1 problem in relational databases and how does it manifest in GraphQL?
+> **Answer**: 
+> If a GraphQL query requests 50 users and their department (`users { id department { name } }`), a naive resolver executes 1 query for the 50 users, and then 50 separate queries for each user's department (`1 + N = 51 queries`). In our architecture, we mitigate this in two ways:
+> 1. At the ORM level via Objection's `withGraphFetched` (executes 2 batched SQL queries using `WHERE user_id IN (...)`).
+> 2. At the GraphQL resolver level via **DataLoader**, which batches and deduplicates IDs across asynchronous resolver ticks.
+
+#### Q2: Why is `BIGINT UNSIGNED` preferred over `UUIDv4` as an internal primary key in MariaDB InnoDB tables?
+> **Answer**: 
+> InnoDB stores tables as **Clustered Indexes** ordered by the primary key. 
+> 1. Auto-incrementing `BIGINT` ensures sequential page appends at the end of the B+ Tree, avoiding expensive **page splits** and index fragmentation.
+> 2. `BIGINT` takes 8 bytes vs 36 bytes for a UUID string (or 16 bytes for binary UUID), reducing memory footprint in the buffer pool and dramatically shrinking secondary index sizes.
+> 3. For public-facing exposure, opaque cursors or external public IDs can be used without compromising internal clustering performance.
+
+#### Q3: Why should composite indexes lead with `tenant_id`?
+> **Answer**: 
+> In B-Tree indexes, queries can only utilize an index if they match a **leftmost prefix** of the indexed columns. By placing `tenant_id` as the leading column `(tenant_id, status, deleted_at)`:
+> 1. All tenant-scoped queries immediately prune 99%+ of the index B-tree.
+> 2. Queries on `(tenant_id)` or `(tenant_id, status)` can reuse the same composite index.
+
+#### Q4: How do database deadlocks occur in transactions, and what is the production mitigation?
+> **Answer**: 
+> Deadlocks occur when Transaction A locks Row 1 and waits for Row 2, while Transaction B locks Row 2 and waits for Row 1. 
+> Mitigations:
+> 1. **Consistent Lock Ordering**: Always acquire locks on rows in deterministic order (e.g., sort primary keys before locking).
+> 2. **Short Transactions**: Minimize processing time inside the transaction boundary; perform network calls and slow hashing outside the transaction.
+> 3. **Automatic Retry with Exponential Backoff & Jitter**: Catch MariaDB Error `1213: Deadlock found when trying to get lock` and retry the transaction after a randomized delay.
+
